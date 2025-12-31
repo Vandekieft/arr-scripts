@@ -21,9 +21,11 @@
 # radarr_moviefile_path="/movies/Movie (2024)/DUMMY.mkv" \
 # radarr_movie_path="/movies/Movie (2024)" \
 # DRY_RUN=false \
-# ./extras_script.sh
+# ./extras_script.bash
 # ==================================================================
-# v1.0.0
+# v1.0.1
+
+# ========================= USER SETTINGS ===========================
 
 # ========================= USER SETTINGS ===========================
 
@@ -34,9 +36,9 @@ LOG_FILE="/config/logs/local_extras.txt"
 DRY_RUN="${DRY_RUN:-false}"
 INLINE_STRICT="${INLINE_STRICT:-false}"
 
-RENAME_MODE="plex"
-STORAGE_MODE="inline"
-UNKNOWN_MODE="generous"
+RENAME_MODE="plex"      # plex | jellyfin | kodi | none
+STORAGE_MODE="inline"   # inline | folders
+UNKNOWN_MODE="generous" # generous | strict | skip
 
 ENABLE_TRAILERS=true
 ENABLE_BEHIND_SCENES=true
@@ -55,8 +57,9 @@ IGNORE_FOLDERS=("subs" "subtitles" "bdmv" "certificate" "audio" "video_ts" "samp
 
 VIDEO_EXTENSIONS="mkv mp4 mov avi m4v webm mpg mpeg ts m2ts flv f4v 3gp 3g2 wmv asf"
 
+# Keyword buckets for both folder and inline detection
 declare -A FOLDER_KEYWORDS=(
-    ["trailer"]="trailer"
+    ["trailer"]="trailer trailers"
     ["behind"]="behind the scenes bts behind"
     ["featurette"]="featurette featurettes"
     ["interview"]="interview interviews"
@@ -65,6 +68,19 @@ declare -A FOLDER_KEYWORDS=(
     ["short"]="short shorts"
     ["extra"]="extra extras bonus"
     ["other"]="other misc"
+)
+
+# Priority for overlapping matches (higher wins)
+declare -A TYPE_PRIORITY=(
+    [deleted]=100
+    [trailer]=90
+    [behind]=80
+    [featurette]=70
+    [interview]=60
+    [scene]=50
+    [short]=40
+    [extra]=10
+    [other]=10
 )
 
 INLINE_SUFFIXES=(
@@ -98,7 +114,8 @@ is_video() {
 }
 
 folder_is_ignored() {
-    local name=$(lower "$1")
+    local name
+    name=$(lower "$1")
     for ig in "${IGNORE_FOLDERS[@]}"; do
         [[ "$name" == *"$ig"* ]] && return 0
     done
@@ -171,6 +188,109 @@ copy_item() {
 }
 
 
+# ---------- Detection helpers ----------
+
+# Generic weighted type detection from any string (filename or folder)
+detect_type_from_string() {
+    local text
+    text=$(lower "$1")
+
+    local best_type=""
+    local best_score=0
+
+    for t in "${!FOLDER_KEYWORDS[@]}"; do
+        for kw in ${FOLDER_KEYWORDS[$t]}; do
+            if [[ "$text" == *"$kw"* ]]; then
+                local score=${TYPE_PRIORITY[$t]:-0}
+                if (( score > best_score )); then
+                    best_score=$score
+                    best_type=$t
+                fi
+            fi
+        done
+    done
+
+    [[ -n "$best_type" ]] && printf '%s\n' "$best_type" || return 1
+}
+
+detect_folder_type() {
+    detect_type_from_string "$1" || printf '%s\n' "other"
+}
+
+# Strip basic tags from movie title for comparison
+normalize_title() {
+    local s
+    s=$(lower "$1")
+
+    # remove extension
+    s="${s%.*}"
+
+    # replace separators with spaces
+    s="${s//./ }"
+    s="${s//_/ }"
+    s="${s//-/ }"
+    s="${s//\(/ }"
+    s="${s//\)/ }"
+    s="${s//
+
+\[/ }"
+    s="${s//\]
+
+/ }"
+
+    # remove year patterns (simple and safe)
+    s="${s//19[0-9][0-9]/ }"
+    s="${s//20[0-9][0-9]/ }"
+
+    # collapse multiple spaces
+    s=$(echo "$s" | tr -s ' ')
+
+    printf '%s' "$s"
+}
+
+
+# Check if given filename resembles the movie file name
+resembles_movie_title() {
+    local fname_base="$1"
+    local movie_path="$2"
+
+    local movie_name movie_base normalized_movie normalized_file
+
+    movie_name=$(basename "$movie_path")
+    movie_base="${movie_name%.*}"
+
+    normalized_movie=$(normalize_title "$movie_base")
+    normalized_file=$(normalize_title "$fname_base")
+
+    # Compare first N characters of normalized movie title
+    local probe_len=12
+    local movie_probe=${normalized_movie:0:$probe_len}
+
+    [[ -n "$movie_probe" && "$normalized_file" == *"$movie_probe"* ]]
+}
+
+# INLINE detection with support for strict suffix mode and weighted keywords
+detect_inline_type() {
+    local filename="$1"
+    local fname_lower
+    fname_lower=$(lower "$filename")
+
+    # Strict mode: only respect known suffix patterns before extension
+    if [[ "$INLINE_STRICT" == true ]]; then
+        for suffix in "${INLINE_SUFFIXES[@]}"; do
+            if [[ "$fname_lower" == *"$suffix."* ]]; then
+                printf '%s\n' "${suffix#-}"
+                return 0
+            fi
+        done
+        # strict: no suffix → unknown
+        return 1
+    else
+        detect_type_from_string "$fname_lower" || return 1
+    fi
+}
+
+
 # ========================= RADARR TEST MODE ========================
 
 if [[ -z "${radarr_moviefile_sourcefolder:-}" ]] || [[ -z "${radarr_moviefile_path:-}" ]]; then
@@ -211,41 +331,108 @@ if (( ${#ALL_VIDEOS[@]} == 0 )); then
     exit 0
 fi
 
-
-# ========================= MOVIE DETECTION (STAT-BASED) ============
-
-if (( ${#ALL_VIDEOS[@]} == 1 )); then
-    log "Only one video file found in source folder — treating it as the movie and skipping."
-    log "File: ${ALL_VIDEOS[0]}"
-    exit 0
-fi
-
-largest_file=""
-largest_size=0
+# Classify files into root vs subfolder
+ROOT_VIDEOS=()
+SUB_VIDEOS=()
 
 for f in "${ALL_VIDEOS[@]}"; do
-    size=$(stat -c%s "$f")
-    if (( size > largest_size )); then
-        largest_size=$size
-        largest_file="$f"
+    if [[ "$(dirname "$f")" == "$SOURCE_DIR" ]]; then
+        ROOT_VIDEOS+=("$f")
+    else
+        SUB_VIDEOS+=("$f")
     fi
 done
 
-MOVIE_FILE="$largest_file"
-log "Largest file detected via stat(): $MOVIE_FILE ($largest_size bytes)"
+ROOT_COUNT=${#ROOT_VIDEOS[@]}
+SUB_COUNT=${#SUB_VIDEOS[@]}
+TOTAL_COUNT=${#ALL_VIDEOS[@]}
+
+log "Video counts – total: $TOTAL_COUNT, root: $ROOT_COUNT, subfolders: $SUB_COUNT"
+
+
+# ========================= SINGLE-FILE & STRUCTURE LOGIC ===========
+
+handle_single_file() {
+    local single="$1"
+    local fname_base
+    fname_base=$(basename "$single")
+    local fname_lower
+    fname_lower=$(lower "$fname_base")
+    local parent_lower
+    parent_lower=$(lower "$(basename "$SOURCE_DIR")")
+
+    local filename_type parent_type
+    filename_type=$(detect_type_from_string "$fname_lower" || true)
+    parent_type=$(detect_type_from_string "$parent_lower" || true)
+
+    local resembles=false
+    if resembles_movie_title "$fname_base" "$MOVIE_FILE"; then
+        resembles=true
+    fi
+
+    # Hybrid logic:
+    # 1) If filename clearly indicates extra (weighted) AND not clearly movie → extra
+    if [[ -n "$filename_type" && "$resembles" == false ]]; then
+        log "Single file detected — filename indicates extra ($filename_type)."
+        copy_item "$single" "$filename_type"
+        exit 0
+    fi
+
+    # 2) If parent indicates extras and filename not clearly movie → extra
+    if [[ -n "$parent_type" && "$resembles" == false ]]; then
+        log "Single file detected — parent folder indicates extra ($parent_type)."
+        copy_item "$single" "$parent_type"
+        exit 0
+    fi
+
+    # 3) If filename resembles movie title AND does not contain explicit extra keyword → movie
+    if [[ "$resembles" == true && -z "$filename_type" ]]; then
+        log "Single file detected — resembles movie title and no extra keywords; treating as movie."
+        exit 0
+    fi
+
+    # 4) If filename resembles movie title but does have extra keyword → extra wins
+    if [[ "$resembles" == true && -n "$filename_type" ]]; then
+        log "Single file detected — resembles movie title but filename indicates extra ($filename_type); treating as extra."
+        copy_item "$single" "$filename_type"
+        exit 0
+    fi
+
+    # 5) Fall-back: no strong signals → assume movie
+    log "Single file detected — no strong extra signals; treating as movie."
+    exit 0
+}
+
+
+# Structure-aware decision before stat-based largest-file approach
+
+if (( TOTAL_COUNT == 1 )); then
+    handle_single_file "${ALL_VIDEOS[0]}"
+fi
+
+# If exactly one file in root and others in subfolders: root is likely movie
+if (( ROOT_COUNT == 1 && SUB_COUNT >= 1 )); then
+    MOVIE_FILE="${ROOT_VIDEOS[0]}"
+    log "Directory structure suggests root file as movie: $MOVIE_FILE"
+else
+    # ========================= MOVIE DETECTION (STAT-BASED) ============
+    largest_file=""
+    largest_size=0
+
+    for f in "${ALL_VIDEOS[@]}"; do
+        size=$(stat -c%s "$f")
+        if (( size > largest_size )); then
+            largest_size=$size
+            largest_file="$f"
+        fi
+    done
+
+    MOVIE_FILE="$largest_file"
+    log "Largest file detected via stat(): $MOVIE_FILE ($largest_size bytes)"
+fi
 
 
 # ========================= FOLDER EXTRA DETECTION ==================
-
-detect_folder_type() {
-    local name=$(lower "$1")
-    for type in "${!FOLDER_KEYWORDS[@]}"; do
-        for kw in ${FOLDER_KEYWORDS[$type]}; do
-            [[ "$name" == *"$kw"* ]] && echo "$type" && return
-        done
-    done
-    echo "other"
-}
 
 mapfile -t EXTRA_DIRS < <(
     find "$SOURCE_DIR" -type d | while read -r d; do
@@ -286,22 +473,15 @@ done
 for file in "${ALL_VIDEOS[@]}"; do
     [[ "$file" == "$MOVIE_FILE" ]] && continue
 
-    fname=$(lower "$(basename "$file")")
+    fname_base=$(basename "$file")
+    fname_lower=$(lower "$fname_base")
     type=""
 
-    if [[ "$INLINE_STRICT" == true ]]; then
-        for suffix in "${INLINE_SUFFIXES[@]}"; do
-            if [[ "$fname" == *"$suffix."* ]]; then
-                type="${suffix#-}"
-                break
-            fi
-        done
+    # Inline detection (strict or forgiving)
+    if type=$(detect_inline_type "$fname_base" 2>/dev/null); then
+        :
     else
-        for t in "${!FOLDER_KEYWORDS[@]}"; do
-            for kw in ${FOLDER_KEYWORDS[$t]}; do
-                [[ "$fname" == *"$kw"* ]] && type="$t"
-            done
-        done
+        type=""
     fi
 
     if [[ -n "$type" ]]; then
